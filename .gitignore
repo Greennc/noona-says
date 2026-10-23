@@ -1,0 +1,15 @@
+# dependencies
+node_modules/
+
+# build output
+ui/dist/
+
+# secrets
+.env
+.env.*
+*.pem
+*.key
+
+# misc
+*.log
+.DS_Store

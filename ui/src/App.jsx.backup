@@ -1,0 +1,198 @@
+import { useState, useEffect, useRef } from 'react';
+import './index.css';
+
+const API = window.location.hostname === 'localhost'
+  ? 'http://localhost:3002'
+  : 'https://noonasays.app';
+
+function App() {
+  const [scenarios, setScenarios] = useState([]);
+  const [conversationId, setConversationId] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [corrections, setCorrections] = useState({});
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [showRomanization, setShowRomanization] = useState(true);
+  const [showEnglish, setShowEnglish] = useState(true);
+  const [showCorrections, setShowCorrections] = useState(true);
+  const [currentScenario, setCurrentScenario] = useState(null);
+  const messagesEndRef = useRef(null);
+
+  useEffect(() => {
+    fetch(`${API}/scenarios`).then(r => r.json()).then(d => setScenarios(d.scenarios || []));
+    const saved = localStorage.getItem('noona_conversation_id');
+    if (saved) {
+      setConversationId(saved);
+      loadConversation(saved);
+    }
+  }, []);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  const loadConversation = async (id) => {
+    const r = await fetch(`${API}/conversation/${id}`);
+    const d = await r.json();
+    setMessages(d.messages || []);
+    const corrMap = {};
+    (d.messages || []).forEach(m => {
+      if (m.kr_corrections && m.kr_corrections.length) {
+        corrMap[m.id] = m.kr_corrections[0];
+      }
+    });
+    setCorrections(corrMap);
+  };
+
+  const startScenario = async (scenarioId) => {
+    const r = await fetch(`${API}/start-conversation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scenario_id: scenarioId })
+    });
+    const d = await r.json();
+    setConversationId(d.conversation_id);
+    setCurrentScenario(d.scenario);
+    localStorage.setItem('noona_conversation_id', d.conversation_id);
+    setMessages([d.opening_message]);
+    setCorrections({});
+  };
+
+  const sendMessage = async () => {
+    if (!input.trim() || loading || !conversationId) return;
+    const userText = input.trim();
+    setInput('');
+    setLoading(true);
+
+    const tempUserMsg = {
+      id: 'temp-' + Date.now(),
+      role: 'user',
+      user_input: userText,
+      created_at: new Date().toISOString()
+    };
+    setMessages(m => [...m, tempUserMsg]);
+
+    try {
+      const r = await fetch(`${API}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversation_id: conversationId, message: userText })
+      });
+      const d = await r.json();
+      await loadConversation(conversationId);
+    } catch (e) {
+      console.error(e);
+    }
+    setLoading(false);
+  };
+
+  const resetConversation = () => {
+    localStorage.removeItem('noona_conversation_id');
+    setConversationId(null);
+    setMessages([]);
+    setCorrections({});
+    setCurrentScenario(null);
+  };
+
+  if (!conversationId) {
+    return (
+      <div className="welcome">
+        <div className="welcome-inner">
+          <h1>noona says</h1>
+          <p className="tagline">your korean older sister, ready to teach</p>
+          <div className="scenarios">
+            <h2>pick a scenario</h2>
+            {scenarios.map(s => (
+              <div key={s.id} className="scenario-card" onClick={() => startScenario(s.id)}>
+                <div className="scenario-title">{s.title}</div>
+                <div className="scenario-location">{s.location} · {s.difficulty}</div>
+                <div className="scenario-desc">{s.description}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="app">
+      <header>
+        <div className="header-left">
+          <button className="reset-btn" onClick={resetConversation}>← scenarios</button>
+          {currentScenario && <span className="header-title">{currentScenario.title}</span>}
+        </div>
+        <div className="toggles">
+          <label><input type="checkbox" checked={showRomanization} onChange={e => setShowRomanization(e.target.checked)} /> rom.</label>
+          <label><input type="checkbox" checked={showEnglish} onChange={e => setShowEnglish(e.target.checked)} /> eng.</label>
+          <label><input type="checkbox" checked={showCorrections} onChange={e => setShowCorrections(e.target.checked)} /> noona</label>
+        </div>
+      </header>
+
+      <main>
+        <div className="chat">
+          {messages.map(m => (
+            <div key={m.id} className={`message ${m.role}`}>
+              {m.role === 'assistant' ? (
+                <div className="bubble assistant-bubble">
+                  <div className="korean">{m.content_korean}</div>
+                  {showRomanization && <div className="romanization">{m.content_romanization}</div>}
+                  {showEnglish && <div className="english">{m.content_english}</div>}
+                  {m.metadata?.action && <div className="action">*{m.metadata.action}*</div>}
+                </div>
+              ) : (
+                <div className="bubble user-bubble">
+                  <div className="user-text">{m.user_input}</div>
+                  {showCorrections && corrections[m.id] && (
+                    <div className={`correction severity-${corrections[m.id].severity}`}>
+                      <div className="correction-header">noona says:</div>
+                      {corrections[m.id].positive_note && (
+                        <div className="positive">✓ {corrections[m.id].positive_note}</div>
+                      )}
+                      {corrections[m.id].correct_version_korean && (
+                        <div className="suggestion">
+                          <div className="suggestion-korean">{corrections[m.id].correct_version_korean}</div>
+                          <div className="suggestion-rom">{corrections[m.id].correct_version_romanization}</div>
+                        </div>
+                      )}
+                      {corrections[m.id].pattern_note && (
+                        <div className="pattern">{corrections[m.id].pattern_note}</div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+          {loading && (
+            <div className="message assistant">
+              <div className="bubble assistant-bubble loading">
+                <div className="dots"><span>·</span><span>·</span><span>·</span></div>
+              </div>
+            </div>
+          )}
+          <div ref={messagesEndRef} />
+        </div>
+
+        <div className="input-area">
+          <textarea
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+              }
+            }}
+            placeholder="type in english, hangul, or romanization..."
+            disabled={loading}
+            rows={2}
+          />
+          <button onClick={sendMessage} disabled={loading || !input.trim()}>send</button>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+export default App;

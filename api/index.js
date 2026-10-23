@@ -1,0 +1,1155 @@
+import Anthropic from '@anthropic-ai/sdk';
+import { createClient } from '@supabase/supabase-js';
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import crypto from 'crypto';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+dotenv.config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const PORT = process.env.PORT || 3002;
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ============================================================
+// AI PROVIDER TOGGLE - Claude or DeepSeek via AI_PROVIDER env var
+// ============================================================
+const AI_PROVIDER = (process.env.AI_PROVIDER || 'claude').toLowerCase();
+console.log(`[noona] AI provider: ${AI_PROVIDER}`);
+
+// Unified AI client that matches Claude's response shape regardless of provider
+const aiClient = {
+  messages: {
+    create: async (params) => {
+      if (AI_PROVIDER === 'deepseek') {
+        return callDeepSeek(params);
+      }
+      return anthropic.messages.create(params);
+    }
+  }
+};
+
+// DeepSeek caller - uses OpenAI-compatible API, returns Claude-shaped response
+async function callDeepSeek({ model, max_tokens, system, messages }) {
+  // Map Claude's separate system+messages into OpenAI's unified messages array
+  const openaiMessages = [];
+  if (system) openaiMessages.push({ role: 'system', content: system });
+  for (const m of messages) {
+    openaiMessages.push({
+      role: m.role,
+      content: typeof m.content === 'string' ? m.content : m.content.map(c => c.text || '').join('')
+    });
+  }
+
+  const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: 'deepseek-chat',
+      messages: openaiMessages,
+      max_tokens: max_tokens,
+      temperature: 0.7
+    })
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`DeepSeek API error: ${response.status} - ${err}`);
+  }
+
+  const data = await response.json();
+  
+  // Shape the response to match Claude's format so calling code doesn't change
+  return {
+    content: [{ type: 'text', text: data.choices[0].message.content }],
+    usage: {
+      input_tokens: data.usage.prompt_tokens,
+      output_tokens: data.usage.completion_tokens
+    },
+    stop_reason: data.choices[0].finish_reason,
+    model: data.model
+  };
+}
+
+// Cost calculation that knows which provider was used
+function calculateAICost(inputTokens, outputTokens) {
+  // Per million tokens
+  if (AI_PROVIDER === 'deepseek') {
+    // deepseek-chat: $0.27 input / $1.10 output per 1M tokens
+    return ((inputTokens / 1000000) * 0.27) + ((outputTokens / 1000000) * 1.10);
+  }
+  // Claude Sonnet 4.5: $3 input / $15 output per 1M tokens
+  return ((inputTokens / 1000000) * 3) + ((outputTokens / 1000000) * 15);
+}
+
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
+
+// ============================================================
+// DEMO MODE — protection layer for demo.noonasays.app
+// ============================================================
+const DEMO_HOST = 'demo.noonasays.app';
+const DEMO_DAILY_CAP_USD = 5.00;
+const DEMO_MAX_MESSAGES_PER_VISITOR = 10;
+const DEMO_RATE_LIMIT_SECONDS = 5;
+
+function isDemoRequest(req) {
+  const host = req.get('host') || '';
+  return host.toLowerCase().includes(DEMO_HOST);
+}
+
+function getVisitorFingerprint(req) {
+  // Simple fingerprint: IP + user-agent hash
+  const ip = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+  const ua = req.headers['user-agent'] || 'unknown';
+  // Hash to keep it short
+  const hash = crypto.createHash('sha256').update(ip + '|' + ua).digest('hex').substring(0, 32);
+  return { fingerprint: hash, ip, ua };
+}
+
+async function checkDemoLimits(req) {
+  const { fingerprint, ip, ua } = getVisitorFingerprint(req);
+  const today = new Date().toISOString().split('T')[0];
+
+  // 1. Check daily spend cap
+  const { data: dailyRow } = await supabase
+    .from('demo_daily_spend')
+    .select('*')
+    .eq('date_key', today)
+    .maybeSingle();
+
+  if (dailyRow && parseFloat(dailyRow.total_cost) >= DEMO_DAILY_CAP_USD) {
+    return {
+      blocked: true,
+      reason: 'daily_cap',
+      message: "The demo has hit its daily budget. Please come back tomorrow! ☕",
+      status: 429
+    };
+  }
+
+  // 2. Get or create visitor record
+  let { data: visitor } = await supabase
+    .from('demo_visitors')
+    .select('*')
+    .eq('visitor_fingerprint', fingerprint)
+    .maybeSingle();
+
+  if (!visitor) {
+    const { data: newVisitor } = await supabase
+      .from('demo_visitors')
+      .insert({
+        visitor_fingerprint: fingerprint,
+        ip_address: ip,
+        user_agent: ua.substring(0, 500)
+      })
+      .select()
+      .single();
+    visitor = newVisitor;
+  }
+
+  // 3. Check if visitor is blocked
+  if (visitor.blocked) {
+    return {
+      blocked: true,
+      reason: visitor.blocked_reason || 'blocked',
+      message: "Thanks for trying Noona Says! You've reached the demo limit. Want unlimited access? Email asha@example.com",
+      status: 429,
+      visitor
+    };
+  }
+
+  // 4. Check per-visitor message cap
+  if (visitor.message_count >= DEMO_MAX_MESSAGES_PER_VISITOR) {
+    // Mark as blocked permanently
+    await supabase
+      .from('demo_visitors')
+      .update({ blocked: true, blocked_reason: 'message_cap' })
+      .eq('id', visitor.id);
+    return {
+      blocked: true,
+      reason: 'message_cap',
+      message: `Thanks for trying Noona Says! You've used your ${DEMO_MAX_MESSAGES_PER_VISITOR} demo messages. Want unlimited access? Email asha@example.com`,
+      status: 429,
+      visitor
+    };
+  }
+
+  // 5. Check rate limit (1 message per 5 seconds)
+  if (visitor.last_message_at) {
+    const lastMessageTime = new Date(visitor.last_message_at).getTime();
+    const elapsed = (Date.now() - lastMessageTime) / 1000;
+    if (elapsed < DEMO_RATE_LIMIT_SECONDS) {
+      const wait = Math.ceil(DEMO_RATE_LIMIT_SECONDS - elapsed);
+      return {
+        blocked: true,
+        reason: 'rate_limit',
+        message: `Easy there! Please wait ${wait} more second${wait === 1 ? '' : 's'} before sending another message.`,
+        status: 429,
+        visitor
+      };
+    }
+  }
+
+  // All checks passed
+  return {
+    blocked: false,
+    visitor,
+    fingerprint,
+    today,
+    messagesRemaining: DEMO_MAX_MESSAGES_PER_VISITOR - visitor.message_count
+  };
+}
+
+async function trackDemoUsage(checkResult, costUsd) {
+  if (!checkResult || checkResult.blocked) return;
+  const { visitor, today } = checkResult;
+
+  // Increment visitor message count and last_message_at + cost
+  await supabase
+    .from('demo_visitors')
+    .update({
+      message_count: visitor.message_count + 1,
+      total_cost: parseFloat(visitor.total_cost || 0) + parseFloat(costUsd),
+      last_message_at: new Date().toISOString(),
+      last_seen_at: new Date().toISOString()
+    })
+    .eq('id', visitor.id);
+
+  // Upsert daily spend
+  const { data: existingDay } = await supabase
+    .from('demo_daily_spend')
+    .select('*')
+    .eq('date_key', today)
+    .maybeSingle();
+
+  if (existingDay) {
+    const newCost = parseFloat(existingDay.total_cost) + parseFloat(costUsd);
+    const capHit = newCost >= DEMO_DAILY_CAP_USD && !existingDay.cap_hit_at;
+    await supabase
+      .from('demo_daily_spend')
+      .update({
+        total_cost: newCost,
+        total_messages: existingDay.total_messages + 1,
+        cap_hit_at: capHit ? new Date().toISOString() : existingDay.cap_hit_at,
+        updated_at: new Date().toISOString()
+      })
+      .eq('date_key', today);
+  } else {
+    await supabase
+      .from('demo_daily_spend')
+      .insert({
+        date_key: today,
+        total_cost: parseFloat(costUsd),
+        total_messages: 1,
+        total_visitors: 1
+      });
+  }
+}
+
+// Status endpoint - tells the demo UI how many messages this visitor has left
+app.get('/demo/status', async (req, res) => {
+  if (!isDemoRequest(req)) {
+    return res.json({ demo: false });
+  }
+  const check = await checkDemoLimits(req);
+  res.json({
+    demo: true,
+    blocked: check.blocked,
+    reason: check.reason,
+    message: check.message,
+    messagesUsed: check.visitor?.message_count || 0,
+    messagesRemaining: check.blocked ? 0 : (check.messagesRemaining ?? DEMO_MAX_MESSAGES_PER_VISITOR),
+    messagesCap: DEMO_MAX_MESSAGES_PER_VISITOR
+  });
+});
+
+
+
+// ============================================================
+// SECRET KEY AUTH — protects noonasays.app from public use
+// (demo.noonasays.app is intentionally public and has its own limits)
+// ============================================================
+const APP_SECRET_KEY = process.env.APP_SECRET_KEY;
+if (!APP_SECRET_KEY) {
+  console.warn('[noona] WARNING: APP_SECRET_KEY not set in .env — personal site will be UNPROTECTED');
+}
+
+function isAuthorized(req) {
+  // Demo subdomain doesn't need a key
+  if (isDemoRequest(req)) return true;
+  // No key configured? Allow (for dev/safety so we don't lock ourselves out completely)
+  if (!APP_SECRET_KEY) return true;
+  // Check header or query param
+  const provided = req.headers['x-app-key'] || req.query.key;
+  return provided === APP_SECRET_KEY;
+}
+
+// Auth check endpoint - UI uses this to verify a key without making a real request
+app.get('/auth/check', (req, res) => {
+  if (isDemoRequest(req)) {
+    return res.json({ authorized: true, demo: true });
+  }
+  const ok = isAuthorized(req);
+  res.json({ authorized: ok, demo: false });
+});
+
+// Middleware: protect protected endpoints
+function requireAuth(req, res, next) {
+  if (!isAuthorized(req)) {
+    return res.status(401).json({ error: 'Not authorized', code: 'NO_AUTH' });
+  }
+  next();
+}
+
+
+// ============================================================
+// HEALTH CHECK
+// ============================================================
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', app: 'noona', timestamp: new Date().toISOString() });
+});
+
+// ============================================================
+// LIST SCENARIOS - so the UI can show available practice options
+// ============================================================
+app.get('/scenarios', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('kr_scenarios')
+      .select('id, title, description, location, difficulty, goal')
+      .order('difficulty', { ascending: true });
+    if (error) throw error;
+    res.json({ scenarios: data });
+  } catch (err) {
+    console.error('Scenarios error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// START CONVERSATION - creates a new conversation for a scenario
+// ============================================================
+app.post('/start-conversation', requireAuth, async (req, res) => {
+  try {
+    const { scenario_id } = req.body;
+
+    // Get scenario details
+    const { data: scenario, error: scenarioError } = await supabase
+      .from('kr_scenarios')
+      .select('*')
+      .eq('id', scenario_id)
+      .single();
+    if (scenarioError) throw scenarioError;
+
+    // Create new conversation
+    const { data: conversation, error: convError } = await supabase
+      .from('kr_conversations')
+      .insert({
+        scenario_id,
+        current_difficulty: scenario.difficulty,
+        scene_state: { location: scenario.location }
+      })
+      .select()
+      .single();
+    if (convError) throw convError;
+
+    // Insert opening message from the character
+    const { data: openingMessage, error: msgError } = await supabase
+      .from('kr_messages')
+      .insert({
+        conversation_id: conversation.id,
+        character_id: scenario.starting_character_id,
+        role: 'assistant',
+        content_korean: scenario.opening_message_korean,
+        content_romanization: scenario.opening_message_romanization,
+        content_english: scenario.opening_message_english,
+        metadata: { is_opening: true }
+      })
+      .select()
+      .single();
+    if (msgError) throw msgError;
+
+    res.json({
+      conversation_id: conversation.id,
+      scenario,
+      opening_message: openingMessage
+    });
+  } catch (err) {
+    console.error('Start conversation error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// CHAT - main endpoint for each turn
+// ============================================================
+app.post('/chat', requireAuth, async (req, res) => {
+  try {
+    const { conversation_id, message, input_language } = req.body;
+    if (!conversation_id || !message) {
+      return res.status(400).json({ error: 'conversation_id and message required' });
+    }
+
+    // DEMO MODE: enforce limits
+    let demoCheck = null;
+    if (isDemoRequest(req)) {
+      demoCheck = await checkDemoLimits(req);
+      if (demoCheck.blocked) {
+        return res.status(demoCheck.status).json({
+          error: demoCheck.message,
+          demo_blocked: true,
+          reason: demoCheck.reason
+        });
+      }
+    }
+
+    // Get conversation + scenario context
+    const { data: conversation, error: convError } = await supabase
+      .from('kr_conversations')
+      .select('*, kr_scenarios(*)')
+      .eq('id', conversation_id)
+      .single();
+    if (convError) throw convError;
+    const scenario = conversation.kr_scenarios;
+
+    // Get the character for this scene
+    const { data: character, error: charError } = await supabase
+      .from('kr_characters')
+      .select('*')
+      .eq('id', scenario.starting_character_id)
+      .single();
+    if (charError) throw charError;
+
+    // Get recent messages for context
+    const { data: recentMessages } = await supabase
+      .from('kr_messages')
+      .select('*')
+      .eq('conversation_id', conversation_id)
+      .order('created_at', { ascending: true })
+      .limit(20);
+
+    // Insert the user's message first
+    const { data: userMessage, error: userMsgError } = await supabase
+      .from('kr_messages')
+      .insert({
+        conversation_id,
+        role: 'user',
+        user_input: message,
+        user_input_language: input_language || 'mixed'
+      })
+      .select()
+      .single();
+    if (userMsgError) throw userMsgError;
+
+    // Build conversation history for the character call
+    const historyForCharacter = (recentMessages || []).map(m => {
+      if (m.role === 'user') {
+        return { role: 'user', content: m.user_input };
+      } else {
+        return { role: 'assistant', content: JSON.stringify({
+          korean: m.content_korean,
+          romanization: m.content_romanization,
+          english: m.content_english
+        }) };
+      }
+    });
+    historyForCharacter.push({ role: 'user', content: message });
+
+    // ============================================================
+    // PARALLEL CALL 1: Character response (Minji speaks in Korean)
+    // PARALLEL CALL 2: Tutor analysis (Noona analyzes the user's message)
+    // We run both at the same time using Promise.all for speed
+    // ============================================================
+
+    const characterPromise = aiClient.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 500,
+      system: character.system_prompt + `
+
+SCENARIO CONTEXT: ${scenario.description}
+SCENE GOAL: ${scenario.goal}
+DIFFICULTY LEVEL: ${conversation.current_difficulty}
+
+The learner is ${conversation.current_difficulty} level. Adjust your vocabulary complexity accordingly. For beginner: very short responses, common words, slow patient phrasing. For intermediate: natural speed and vocab. For advanced: use idioms, slang, faster speech patterns.
+
+Always respond in the JSON format specified.
+
+IMPORTANT ADDITION: Also include a "pronunciation" field in your JSON with a clear English pronunciation guide for your Korean response. Format: syllable breaks with hyphens, arrow, English phonetic spelling. Example: "A-i-seu a-me-ri-ka-no → ah-ee-suh ah-meh-ree-kah-no". Be generous with phonetics — write it how an English speaker would actually pronounce it.
+
+Your full JSON response should now have 5 fields: korean, romanization, pronunciation, english, action.`,
+      messages: historyForCharacter
+    });
+
+    const tutorPromise = aiClient.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 600,
+      system: `You are Noona (누나), a Korean language tutor analyzing what your student Asha just said. She is a complete beginner.
+
+SCENARIO: ${scenario.description}
+SCENE GOAL: ${scenario.goal}
+DIFFICULTY: ${conversation.current_difficulty}
+
+Your job: analyze Asha's last message and provide a gentle correction or affirmation. She is ${conversation.current_difficulty} level — be encouraging.
+
+Respond in this EXACT JSON format (no markdown, no preamble):
+{
+  "what_you_said": "what Asha literally typed",
+  "what_you_meant": "what she likely meant to communicate",
+  "correct_version_korean": "the natural Korean way to say it, in Hangul",
+  "correct_version_romanization": "the romanization",
+  "correct_version_pronunciation": "REQUIRED if correct_version_korean is not empty. Pronunciation guide: syllable break with hyphens, arrow, English phonetic. Example: 'A-i-seu a-me-ri-ka-no ju-se-yo → ah-ee-suh ah-meh-ree-kah-no joo-seh-yo'",
+  "mistake_type": "one of: vocabulary, grammar, particle, formality, pronunciation, none",
+  "pattern_note": "one short sentence in English explaining the key Korean pattern or rule (if any) — empty string if perfect",
+  "positive_note": "one short encouraging sentence about what she got right — always include something positive",
+  "severity": "one of: none, minor, moderate, major"
+}
+
+Rules:
+- If Asha typed in English, give her the Korean version she should have used. Mistake_type = "vocabulary", severity = "minor".
+- If Asha typed correct Korean, severity = "none" and celebrate.
+- If Asha mixed English and Korean, focus on the Korean parts.
+- Keep notes SHORT and friendly. You are a warm older sister, not a strict professor.
+- Never use markdown or code blocks. Just the JSON object.`,
+      messages: [{ role: 'user', content: message }]
+    });
+
+    const [characterResponse, tutorResponse] = await Promise.all([
+      characterPromise,
+      tutorPromise
+    ]);
+
+    // Parse character response
+    let characterContent;
+    try {
+      const text = characterResponse.content[0].text;
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      characterContent = JSON.parse(jsonMatch ? jsonMatch[0] : text);
+    } catch (e) {
+      characterContent = {
+        korean: 'Sorry, I had trouble responding.',
+        romanization: '',
+        english: 'Sorry, I had trouble responding.',
+        action: ''
+      };
+    }
+
+    // Parse tutor response
+    let tutorContent;
+    try {
+      const text = tutorResponse.content[0].text;
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      tutorContent = JSON.parse(jsonMatch ? jsonMatch[0] : text);
+    } catch (e) {
+      tutorContent = {
+        what_you_said: message,
+        what_you_meant: '',
+        correct_version_korean: '',
+        correct_version_romanization: '',
+        mistake_type: 'none',
+        pattern_note: '',
+        positive_note: 'Keep practicing!',
+        severity: 'none'
+      };
+    }
+
+    // Save character's response
+    const { data: assistantMessage, error: aMsgError } = await supabase
+      .from('kr_messages')
+      .insert({
+        conversation_id,
+        character_id: character.id,
+        role: 'assistant',
+        content_korean: characterContent.korean,
+        content_romanization: characterContent.romanization,
+        content_english: characterContent.english,
+        metadata: { 
+          action: characterContent.action || '',
+          pronunciation: characterContent.pronunciation || ''
+        }
+      })
+      .select()
+      .single();
+    if (aMsgError) throw aMsgError;
+
+    // Save the correction linked to the user message
+    if (tutorContent.severity !== 'none' || tutorContent.positive_note) {
+      await supabase
+        .from('kr_corrections')
+        .insert({
+          message_id: userMessage.id,
+          what_you_said: tutorContent.what_you_said,
+          what_you_meant: tutorContent.what_you_meant,
+          correct_version_korean: tutorContent.correct_version_korean,
+          correct_version_romanization: tutorContent.correct_version_romanization,
+          correct_version_pronunciation: tutorContent.correct_version_pronunciation,
+          mistake_type: tutorContent.mistake_type,
+          pattern_note: tutorContent.pattern_note,
+          positive_note: tutorContent.positive_note,
+          severity: tutorContent.severity
+        });
+    }
+
+    // Cost tracking
+    const charTokensIn = characterResponse.usage.input_tokens;
+    const charTokensOut = characterResponse.usage.output_tokens;
+    const tutorTokensIn = tutorResponse.usage.input_tokens;
+    const tutorTokensOut = tutorResponse.usage.output_tokens;
+    const totalIn = charTokensIn + tutorTokensIn;
+    const totalOut = charTokensOut + tutorTokensOut;
+    const cost = calculateAICost(totalIn, totalOut);
+
+    console.log(`[noona] ${character.name} via ${AI_PROVIDER} | in: ${totalIn} | out: ${totalOut} | cost: $${cost.toFixed(4)}`);
+
+    // DEMO MODE: track usage after successful response
+    if (demoCheck && !demoCheck.blocked) {
+      await trackDemoUsage(demoCheck, cost);
+    }
+
+    // Return everything to the UI
+    res.json({
+      character: {
+        name: character.name,
+        korean_name: character.korean_name
+      },
+      message: characterContent,
+      correction: tutorContent,
+      cost: cost.toFixed(4),
+      demo: demoCheck ? {
+        messagesUsed: (demoCheck.visitor?.message_count || 0) + 1,
+        messagesRemaining: demoCheck.messagesRemaining - 1,
+        messagesCap: 10
+      } : null
+    });
+
+  } catch (err) {
+    console.error('Chat error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// GET CONVERSATION HISTORY
+// ============================================================
+app.get('/conversation/:id', requireAuth, async (req, res) => {
+  try {
+    const { data: messages, error } = await supabase
+      .from('kr_messages')
+      .select('*, kr_corrections(*)')
+      .eq('conversation_id', req.params.id)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    res.json({ messages });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// START SERVER
+// ============================================================
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+// ============================================================
+// GET LESSON - returns the lesson for a scenario, generating it if it doesn't exist yet
+// ============================================================
+app.get('/lesson/:scenario_id', requireAuth, async (req, res) => {
+  try {
+    const { scenario_id } = req.params;
+
+    // Check if lesson already exists in cache
+    const { data: existingLesson } = await supabase
+      .from('kr_lessons')
+      .select('*')
+      .eq('scenario_id', scenario_id)
+      .maybeSingle();
+
+    if (existingLesson) {
+      return res.json({ lesson: existingLesson, cached: true });
+    }
+
+    // Generate a new lesson
+    const lesson = await generateLesson(scenario_id);
+    res.json({ lesson, cached: false });
+
+  } catch (err) {
+    console.error('Lesson error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// REGENERATE LESSON - forces a fresh generation
+// ============================================================
+app.post('/lesson/:scenario_id/regenerate', requireAuth, async (req, res) => {
+  try {
+    // Block regeneration in demo mode (it's expensive)
+    if (isDemoRequest(req)) {
+      return res.status(403).json({ error: 'Lesson regeneration is disabled in demo mode' });
+    }
+    const { scenario_id } = req.params;
+    await supabase.from('kr_lessons').delete().eq('scenario_id', scenario_id);
+    const lesson = await generateLesson(scenario_id);
+    res.json({ lesson, cached: false });
+  } catch (err) {
+    console.error('Regenerate lesson error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// HELPER: generate a lesson using Noona
+// ============================================================
+async function generateLesson(scenario_id) {
+  // Get scenario and Noona character
+  const { data: scenario, error: scenarioError } = await supabase
+    .from('kr_scenarios')
+    .select('*')
+    .eq('id', scenario_id)
+    .single();
+  if (scenarioError) throw scenarioError;
+
+  const { data: noona, error: noonaError } = await supabase
+    .from('kr_characters')
+    .select('*')
+    .eq('name', 'Noona')
+    .single();
+  if (noonaError) throw noonaError;
+
+  const lessonPrompt = `You are Noona, preparing Asha for a Korean practice scenario. She is a complete beginner — does not know Hangul yet.
+
+SCENARIO: ${scenario.title}
+LOCATION: ${scenario.location}
+DESCRIPTION: ${scenario.description}
+GOAL: ${scenario.goal}
+CULTURAL NOTES: ${scenario.cultural_notes || 'none'}
+
+TARGET VOCAB: ${JSON.stringify(scenario.target_vocab)}
+TARGET GRAMMAR: ${JSON.stringify(scenario.target_grammar)}
+
+Your job: prepare Asha for this scenario with a warm, encouraging mini-lesson. You are her cool older sister, not a textbook professor. Use English for explanation, Korean for examples.
+
+Respond in this EXACT JSON format (no markdown, no preamble):
+{
+  "intro_text": "2-3 sentences. Set the scene warmly. Tell her where she is going, who she will meet, and what the vibe is. Be encouraging. Sprinkle in 1-2 Korean phrases naturally.",
+  "vocab_items": [
+    {
+      "korean": "the Hangul",
+      "romanization": "the romanization",
+      "english": "the English meaning",
+      "example_phrase": "a short example phrase using this word in Korean",
+      "example_phrase_romanization": "the romanization of the example",
+      "example_phrase_english": "the English of the example",
+      "pronunciation": "REQUIRED. A clear pronunciation guide in this exact format: 'A-i-seu → ah-ee-suh' (syllable break with hyphens, arrow, then English phonetic spelling in quotes). Use English sound approximations a beginner can actually say. Examples: 아이스 → 'A-i-seu → ah-ee-suh', 주세요 → 'Ju-se-yo → joo-seh-yo', 안녕하세요 → 'An-nyeong-ha-se-yo → ahn-nyung-hah-seh-yo'. Be generous with phonetics — write it how an English speaker would actually pronounce it.",
+      "noona_tip": "one short, warm sentence from Noona about this word — when to use it, what to remember, etc."
+    }
+  ],
+  "grammar_items": [
+    {
+      "name": "the pattern name in English",
+      "korean": "the Korean pattern (e.g., ~주세요)",
+      "explanation": "2-3 sentences explaining the pattern in plain English, like Noona is breaking it down for a friend",
+      "example_korean": "an example sentence using this pattern",
+      "example_romanization": "the romanization",
+      "example_pronunciation": "REQUIRED. Same format as vocab pronunciation: syllable break with hyphens, then English phonetic spelling. Example: 'A-i-seu a-me-ri-ka-no ju-se-yo → ah-ee-suh ah-meh-ree-kah-no joo-seh-yo'",
+      "example_english": "the English translation"
+    }
+  ],
+  "closing_text": "1-2 sentences. An encouraging send-off. Tell her to relax, that it is okay to mess up, that you will be there if she needs you. End with something like '준비됐어? Let's go!' or similar."
+}
+
+Rules:
+- Cover EVERY vocab item from the target_vocab array (do not skip any)
+- Cover EVERY grammar item from the target_grammar array
+- Keep tips and explanations SHORT and friendly
+- Noona's voice should feel warm, slightly playful, never condescending
+- Do not use markdown or code blocks in your response, just the JSON object`;
+
+  const response = await aiClient.messages.create({
+    model: 'claude-sonnet-4-5',
+    max_tokens: 3000,
+    system: noona.system_prompt,
+    messages: [{ role: 'user', content: lessonPrompt }]
+  });
+
+  // Parse the lesson
+  const text = response.content[0].text;
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  const lessonData = JSON.parse(jsonMatch ? jsonMatch[0] : text);
+
+  // Save to database
+  const { data: savedLesson, error: saveError } = await supabase
+    .from('kr_lessons')
+    .insert({
+      scenario_id,
+      intro_text: lessonData.intro_text,
+      vocab_items: lessonData.vocab_items,
+      grammar_items: lessonData.grammar_items,
+      closing_text: lessonData.closing_text
+    })
+    .select()
+    .single();
+  if (saveError) throw saveError;
+
+  const tokensIn = response.usage.input_tokens;
+  const tokensOut = response.usage.output_tokens;
+  const cost = ((tokensIn / 1000000) * 3) + ((tokensOut / 1000000) * 15);
+  console.log(`[noona] Generated lesson for scenario ${scenario_id} | cost: $${cost.toFixed(4)}`);
+
+  return savedLesson;
+}
+
+
+// ============================================================
+// HANGUL 101 ENDPOINTS
+// ============================================================
+
+// Helper: get a stable fingerprint for tracking lesson completion
+// For demo users this is IP+UA hashed. For personal site, just use "personal"
+function getHangulFingerprint(req) {
+  if (isDemoRequest(req)) {
+    return getVisitorFingerprint(req).fingerprint;
+  }
+  return 'personal';
+}
+
+// List lessons with completion status
+app.get('/hangul/lessons', async (req, res) => {
+  try {
+    const fingerprint = getHangulFingerprint(req);
+    const isDemo = isDemoRequest(req);
+
+    const { data: lessons, error } = await supabase
+      .from('kr_hangul_lessons')
+      .select('id, sequence_order, title, subtitle, intro_text, estimated_minutes')
+      .order('sequence_order', { ascending: true });
+    if (error) throw error;
+
+    // Get completion for this visitor
+    const { data: completions } = await supabase
+      .from('kr_hangul_progress')
+      .select('lesson_id')
+      .eq('visitor_fingerprint', fingerprint);
+    const completedSet = new Set((completions || []).map(c => c.lesson_id));
+
+    // Mark which lessons are locked
+    // - On demo: only lesson 1 is unlocked; others require follow
+    // - On personal: all unlocked
+    const enriched = lessons.map(l => ({
+      ...l,
+      completed: completedSet.has(l.id),
+      locked: isDemo && l.sequence_order > 1,
+      lock_reason: (isDemo && l.sequence_order > 1) ? 'demo_only_lesson_1' : null
+    }));
+
+    res.json({ lessons: enriched, is_demo: isDemo });
+  } catch (err) {
+    console.error('Hangul lessons error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Fetch one lesson with full content
+app.get('/hangul/lessons/:sequence_order', async (req, res) => {
+  try {
+    const isDemo = isDemoRequest(req);
+    const seqOrder = parseInt(req.params.sequence_order, 10);
+    
+    // Demo gate: only allow lesson 1
+    if (isDemo && seqOrder > 1) {
+      return res.status(403).json({ 
+        error: 'This lesson is only available in the full app',
+        code: 'DEMO_LOCKED'
+      });
+    }
+
+    const { data: lesson, error } = await supabase
+      .from('kr_hangul_lessons')
+      .select('*')
+      .eq('sequence_order', seqOrder)
+      .single();
+    if (error) throw error;
+    res.json({ lesson });
+  } catch (err) {
+    console.error('Hangul lesson fetch error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Mark a lesson complete for the current visitor
+app.post('/hangul/complete/:sequence_order', async (req, res) => {
+  try {
+    const fingerprint = getHangulFingerprint(req);
+    const seqOrder = parseInt(req.params.sequence_order, 10);
+
+    const { data: lesson } = await supabase
+      .from('kr_hangul_lessons')
+      .select('id')
+      .eq('sequence_order', seqOrder)
+      .single();
+    if (!lesson) return res.status(404).json({ error: 'Lesson not found' });
+
+    // Upsert progress
+    await supabase
+      .from('kr_hangul_progress')
+      .upsert({
+        visitor_fingerprint: fingerprint,
+        lesson_id: lesson.id,
+        completed_at: new Date().toISOString()
+      }, { onConflict: 'visitor_fingerprint,lesson_id' });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Hangul complete error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Audio for a Hangul letter - cached after first generation
+app.get('/hangul/letter/:letter/audio', async (req, res) => {
+  try {
+    const letterChar = req.params.letter;
+    
+    // Check cache first - also grab example word for richer audio
+    const { data: existing } = await supabase
+      .from('kr_hangul_letters')
+      .select('audio_base64, sound_description, romanization, example_word_korean')
+      .eq('letter', letterChar)
+      .maybeSingle();
+
+    if (!existing) {
+      return res.status(404).json({ error: 'Letter not found' });
+    }
+
+    // If already cached, return immediately
+    if (existing.audio_base64) {
+      return res.json({ 
+        audio_base64: existing.audio_base64,
+        cached: true 
+      });
+    }
+
+    // Generate with OpenAI TTS - just the sound of the letter
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (!openaiKey) {
+      return res.status(500).json({ error: 'OPENAI_API_KEY not configured' });
+    }
+
+    // Build a TTS-friendly input. Bare Hangul jamos confuse the TTS model
+    // (it tries to spell them as English letters). Wrap vowels in silent ㅇ
+    // to form a proper Korean syllable that pronounces ONLY the vowel sound.
+    // For consonants, build a syllable with ㅏ so the consonant is audible.
+    const VOWELS = ['ㅏ','ㅐ','ㅑ','ㅒ','ㅓ','ㅔ','ㅕ','ㅖ','ㅗ','ㅘ','ㅙ','ㅚ','ㅛ','ㅜ','ㅝ','ㅞ','ㅟ','ㅠ','ㅡ','ㅢ','ㅣ'];
+    const VOWEL_INDEX = VOWELS.indexOf(letterChar);
+    const LEADS = ['ㄱ','ㄲ','ㄴ','ㄷ','ㄸ','ㄹ','ㅁ','ㅂ','ㅃ','ㅅ','ㅆ','ㅇ','ㅈ','ㅉ','ㅊ','ㅋ','ㅌ','ㅍ','ㅎ'];
+    const LEAD_INDEX = LEADS.indexOf(letterChar);
+    let ttsInput;
+    if (VOWEL_INDEX !== -1) {
+      // Vowel: combine with silent ㅇ to form a syllable (ㅇ + vowel)
+      const code = 0xAC00 + (11 * 21 * 28) + (VOWEL_INDEX * 28); // 11 = index of ㅇ in LEADS
+      ttsInput = String.fromCharCode(code);
+    } else if (LEAD_INDEX !== -1 && letterChar !== 'ㅇ') {
+      // Consonants: use the official Korean letter name (e.g. 비읍 for ㅂ).
+      // PLUS the example word from the database, so the learner hears
+      // the consonant TWICE in different contexts. This solves the
+      // 니은 vs 미음 confusion - hearing 'nieun, namu' vs 'mieum, mama'
+      // makes the n/m difference unmistakable.
+      const LETTER_NAMES = {
+        'ㄱ': '기역', 'ㄴ': '니은', 'ㄷ': '디귿', 'ㄹ': '리을',
+        'ㅁ': '미음', 'ㅂ': '비읍', 'ㅅ': '시옷', 'ㅈ': '지읒',
+        'ㅊ': '치읓', 'ㅋ': '키읔', 'ㅌ': '티읕', 'ㅍ': '피읖',
+        'ㅎ': '히읗', 'ㄲ': '쌍기역', 'ㄸ': '쌍디귿', 'ㅃ': '쌍비읍',
+        'ㅆ': '쌍시옷', 'ㅉ': '쌍지읒'
+      };
+      const letterName = LETTER_NAMES[letterChar] || letterChar;
+      const example = existing.example_word_korean;
+      // Format: "letterName. exampleWord." with natural pause via period
+      ttsInput = example ? `${letterName}. ${example}.` : letterName;
+    } else if (letterChar === 'ㅇ') {
+      // Silent ㅇ - we just say "ng" (its end-of-syllable sound)
+      ttsInput = '응';  // means "yes" colloquially, ends in clear "ng"
+    } else {
+      ttsInput = letterChar;
+    }
+    
+    console.log(`[noona] Generating Google TTS for letter "${letterChar}" using input "${ttsInput}"`);
+    
+    const googleKey = process.env.GOOGLE_CLOUD_API_KEY;
+    if (!googleKey) {
+      return res.status(500).json({ error: 'GOOGLE_CLOUD_API_KEY not configured' });
+    }
+    
+    const audioResponse = await fetch(
+      `https://texttospeech.googleapis.com/v1/text:synthesize?key=${googleKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          input: { text: ttsInput },
+          voice: {
+            languageCode: 'ko-KR',
+            name: 'ko-KR-Neural2-A'
+          },
+          audioConfig: {
+            audioEncoding: 'MP3',
+            speakingRate: 0.85,
+            pitch: 0
+          }
+        })
+      }
+    );
+
+    if (!audioResponse.ok) {
+      const errText = await audioResponse.text();
+      console.error('Google TTS failed:', errText);
+      return res.status(500).json({ error: 'TTS generation failed', details: errText });
+    }
+
+    const googleData = await audioResponse.json();
+    const audioBase64 = googleData.audioContent;
+    if (!audioBase64) {
+      console.error('Google TTS returned no audio:', googleData);
+      return res.status(500).json({ error: 'TTS returned no audio' });
+    }
+
+    // Cache it
+    await supabase
+      .from('kr_hangul_letters')
+      .update({ audio_base64: audioBase64 })
+      .eq('letter', letterChar);
+
+    console.log(`[noona] Generated audio for letter ${letterChar} via Google TTS (cached forever)`);
+
+    res.json({ audio_base64: audioBase64, cached: false });
+  } catch (err) {
+    console.error('Hangul audio error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+
+// Audio for a full Korean word - cached after first generation
+// Used by syllable-build success state to let learners hear the word they built
+app.get('/hangul/word/:word/audio', async (req, res) => {
+  try {
+    const word = decodeURIComponent(req.params.word);
+    if (!word || word.length > 30) {
+      return res.status(400).json({ error: 'Invalid word' });
+    }
+
+    // Determine TTS speed by counting Hangul syllables (not characters):
+    // - explicit ?speed=slow → 0.7 (notably slower, for review)
+    // - default → smart-scale by syllable count
+    //   1-2 syllables: 0.95 (close to natural, no truncation)
+    //   3-4 syllables: 0.85 (gentle slowdown)
+    //   5+ syllables: 0.8 (longer phrases get more time)
+    const isSlow = req.query.speed === 'slow';
+    
+    // Count Hangul syllables: range 0xAC00-0xD7A3
+    let syllableCount = 0;
+    for (let i = 0; i < word.length; i++) {
+      const cp = word.charCodeAt(i);
+      if (cp >= 0xAC00 && cp <= 0xD7A3) syllableCount++;
+    }
+    if (syllableCount === 0) syllableCount = word.length; // fallback
+    
+    let speed;
+    if (isSlow) {
+      speed = 0.7;
+    } else if (syllableCount <= 2) {
+      speed = 0.95;
+    } else if (syllableCount <= 4) {
+      speed = 0.85;
+    } else {
+      speed = 0.8;
+    }
+
+    // Cache key includes the speed so different speeds cache separately
+    const cacheKey = '__word__' + word + '__' + (isSlow ? 'slow' : 'normal');
+    
+    // Try to find existing cached audio
+    const { data: existing } = await supabase
+      .from('kr_hangul_letters')
+      .select('audio_base64')
+      .eq('letter', cacheKey)
+      .maybeSingle();
+
+    if (existing && existing.audio_base64) {
+      return res.json({ audio_base64: existing.audio_base64, cached: true });
+    }
+
+    // Generate with Google Cloud TTS - much better Korean pronunciation
+    const googleKey = process.env.GOOGLE_CLOUD_API_KEY;
+    if (!googleKey) {
+      return res.status(500).json({ error: 'GOOGLE_CLOUD_API_KEY not configured' });
+    }
+
+    // Google Cloud TTS: ko-KR-Neural2-A is their best Korean neural voice (female)
+    // speakingRate: 1.0 = normal, 0.5 = half speed
+    // We map our "speed" (0.7-0.95) to Google's speakingRate scale
+    const audioResponse = await fetch(
+      `https://texttospeech.googleapis.com/v1/text:synthesize?key=${googleKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          input: { text: word },
+          voice: {
+            languageCode: 'ko-KR',
+            name: 'ko-KR-Neural2-A'
+          },
+          audioConfig: {
+            audioEncoding: 'MP3',
+            speakingRate: speed,
+            pitch: 0
+          }
+        })
+      }
+    );
+
+    if (!audioResponse.ok) {
+      const errText = await audioResponse.text();
+      console.error('Google TTS failed:', errText);
+      return res.status(500).json({ error: 'TTS generation failed', details: errText });
+    }
+
+    const googleData = await audioResponse.json();
+    const audioBase64 = googleData.audioContent;
+    if (!audioBase64) {
+      console.error('Google TTS returned no audio:', googleData);
+      return res.status(500).json({ error: 'TTS returned no audio' });
+    }
+
+    // Cache it (upsert because the row might not exist)
+    await supabase
+      .from('kr_hangul_letters')
+      .upsert({
+        letter: cacheKey,
+        letter_type: 'word',
+        romanization: word,
+        sound_description: 'cached word audio',
+        audio_base64: audioBase64
+      }, { onConflict: 'letter' });
+
+    console.log(`[noona] Generated word audio for "${word}" via Google TTS (cached forever)`);
+
+    res.json({ audio_base64: audioBase64, cached: false });
+  } catch (err) {
+    console.error('Word audio error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.use(express.static(path.join(__dirname, '../ui/dist')));
+app.get(/.*/, (req, res) => res.sendFile(path.join(__dirname, '../ui/dist/index.html')));
+app.listen(PORT, () => {
+  console.log(`[noona] API running on port ${PORT}`);
+});

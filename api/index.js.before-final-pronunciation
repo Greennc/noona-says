@@ -1,0 +1,488 @@
+import Anthropic from '@anthropic-ai/sdk';
+import { createClient } from '@supabase/supabase-js';
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+dotenv.config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const PORT = process.env.PORT || 3002;
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
+// ============================================================
+// HEALTH CHECK
+// ============================================================
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', app: 'noona', timestamp: new Date().toISOString() });
+});
+
+// ============================================================
+// LIST SCENARIOS - so the UI can show available practice options
+// ============================================================
+app.get('/scenarios', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('kr_scenarios')
+      .select('id, title, description, location, difficulty, goal')
+      .order('difficulty', { ascending: true });
+    if (error) throw error;
+    res.json({ scenarios: data });
+  } catch (err) {
+    console.error('Scenarios error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// START CONVERSATION - creates a new conversation for a scenario
+// ============================================================
+app.post('/start-conversation', async (req, res) => {
+  try {
+    const { scenario_id } = req.body;
+
+    // Get scenario details
+    const { data: scenario, error: scenarioError } = await supabase
+      .from('kr_scenarios')
+      .select('*')
+      .eq('id', scenario_id)
+      .single();
+    if (scenarioError) throw scenarioError;
+
+    // Create new conversation
+    const { data: conversation, error: convError } = await supabase
+      .from('kr_conversations')
+      .insert({
+        scenario_id,
+        current_difficulty: scenario.difficulty,
+        scene_state: { location: scenario.location }
+      })
+      .select()
+      .single();
+    if (convError) throw convError;
+
+    // Insert opening message from the character
+    const { data: openingMessage, error: msgError } = await supabase
+      .from('kr_messages')
+      .insert({
+        conversation_id: conversation.id,
+        character_id: scenario.starting_character_id,
+        role: 'assistant',
+        content_korean: scenario.opening_message_korean,
+        content_romanization: scenario.opening_message_romanization,
+        content_english: scenario.opening_message_english,
+        metadata: { is_opening: true }
+      })
+      .select()
+      .single();
+    if (msgError) throw msgError;
+
+    res.json({
+      conversation_id: conversation.id,
+      scenario,
+      opening_message: openingMessage
+    });
+  } catch (err) {
+    console.error('Start conversation error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// CHAT - main endpoint for each turn
+// ============================================================
+app.post('/chat', async (req, res) => {
+  try {
+    const { conversation_id, message, input_language } = req.body;
+    if (!conversation_id || !message) {
+      return res.status(400).json({ error: 'conversation_id and message required' });
+    }
+
+    // Get conversation + scenario context
+    const { data: conversation, error: convError } = await supabase
+      .from('kr_conversations')
+      .select('*, kr_scenarios(*)')
+      .eq('id', conversation_id)
+      .single();
+    if (convError) throw convError;
+    const scenario = conversation.kr_scenarios;
+
+    // Get the character for this scene
+    const { data: character, error: charError } = await supabase
+      .from('kr_characters')
+      .select('*')
+      .eq('id', scenario.starting_character_id)
+      .single();
+    if (charError) throw charError;
+
+    // Get recent messages for context
+    const { data: recentMessages } = await supabase
+      .from('kr_messages')
+      .select('*')
+      .eq('conversation_id', conversation_id)
+      .order('created_at', { ascending: true })
+      .limit(20);
+
+    // Insert the user's message first
+    const { data: userMessage, error: userMsgError } = await supabase
+      .from('kr_messages')
+      .insert({
+        conversation_id,
+        role: 'user',
+        user_input: message,
+        user_input_language: input_language || 'mixed'
+      })
+      .select()
+      .single();
+    if (userMsgError) throw userMsgError;
+
+    // Build conversation history for the character call
+    const historyForCharacter = (recentMessages || []).map(m => {
+      if (m.role === 'user') {
+        return { role: 'user', content: m.user_input };
+      } else {
+        return { role: 'assistant', content: JSON.stringify({
+          korean: m.content_korean,
+          romanization: m.content_romanization,
+          english: m.content_english
+        }) };
+      }
+    });
+    historyForCharacter.push({ role: 'user', content: message });
+
+    // ============================================================
+    // PARALLEL CALL 1: Character response (Minji speaks in Korean)
+    // PARALLEL CALL 2: Tutor analysis (Noona analyzes the user's message)
+    // We run both at the same time using Promise.all for speed
+    // ============================================================
+
+    const characterPromise = anthropic.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 500,
+      system: character.system_prompt + `
+
+SCENARIO CONTEXT: ${scenario.description}
+SCENE GOAL: ${scenario.goal}
+DIFFICULTY LEVEL: ${conversation.current_difficulty}
+
+The learner is ${conversation.current_difficulty} level. Adjust your vocabulary complexity accordingly. For beginner: very short responses, common words, slow patient phrasing. For intermediate: natural speed and vocab. For advanced: use idioms, slang, faster speech patterns.
+
+Always respond in the JSON format specified.
+
+IMPORTANT ADDITION: Also include a "pronunciation" field in your JSON with a clear English pronunciation guide for your Korean response. Format: syllable breaks with hyphens, arrow, English phonetic spelling. Example: "A-i-seu a-me-ri-ka-no → ah-ee-suh ah-meh-ree-kah-no". Be generous with phonetics — write it how an English speaker would actually pronounce it.
+
+Your full JSON response should now have 5 fields: korean, romanization, pronunciation, english, action.`,
+      messages: historyForCharacter
+    });
+
+    const tutorPromise = anthropic.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 600,
+      system: `You are Noona (누나), a Korean language tutor analyzing what your student Asha just said. She is a complete beginner.
+
+SCENARIO: ${scenario.description}
+SCENE GOAL: ${scenario.goal}
+DIFFICULTY: ${conversation.current_difficulty}
+
+Your job: analyze Asha's last message and provide a gentle correction or affirmation. She is ${conversation.current_difficulty} level — be encouraging.
+
+Respond in this EXACT JSON format (no markdown, no preamble):
+{
+  "what_you_said": "what Asha literally typed",
+  "what_you_meant": "what she likely meant to communicate",
+  "correct_version_korean": "the natural Korean way to say it, in Hangul",
+  "correct_version_romanization": "the romanization",
+  "correct_version_pronunciation": "REQUIRED if correct_version_korean is not empty. Pronunciation guide: syllable break with hyphens, arrow, English phonetic. Example: 'A-i-seu a-me-ri-ka-no ju-se-yo → ah-ee-suh ah-meh-ree-kah-no joo-seh-yo'",
+  "mistake_type": "one of: vocabulary, grammar, particle, formality, pronunciation, none",
+  "pattern_note": "one short sentence in English explaining the key Korean pattern or rule (if any) — empty string if perfect",
+  "positive_note": "one short encouraging sentence about what she got right — always include something positive",
+  "severity": "one of: none, minor, moderate, major"
+}
+
+Rules:
+- If Asha typed in English, give her the Korean version she should have used. Mistake_type = "vocabulary", severity = "minor".
+- If Asha typed correct Korean, severity = "none" and celebrate.
+- If Asha mixed English and Korean, focus on the Korean parts.
+- Keep notes SHORT and friendly. You are a warm older sister, not a strict professor.
+- Never use markdown or code blocks. Just the JSON object.`,
+      messages: [{ role: 'user', content: message }]
+    });
+
+    const [characterResponse, tutorResponse] = await Promise.all([
+      characterPromise,
+      tutorPromise
+    ]);
+
+    // Parse character response
+    let characterContent;
+    try {
+      const text = characterResponse.content[0].text;
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      characterContent = JSON.parse(jsonMatch ? jsonMatch[0] : text);
+    } catch (e) {
+      characterContent = {
+        korean: 'Sorry, I had trouble responding.',
+        romanization: '',
+        english: 'Sorry, I had trouble responding.',
+        action: ''
+      };
+    }
+
+    // Parse tutor response
+    let tutorContent;
+    try {
+      const text = tutorResponse.content[0].text;
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      tutorContent = JSON.parse(jsonMatch ? jsonMatch[0] : text);
+    } catch (e) {
+      tutorContent = {
+        what_you_said: message,
+        what_you_meant: '',
+        correct_version_korean: '',
+        correct_version_romanization: '',
+        mistake_type: 'none',
+        pattern_note: '',
+        positive_note: 'Keep practicing!',
+        severity: 'none'
+      };
+    }
+
+    // Save character's response
+    const { data: assistantMessage, error: aMsgError } = await supabase
+      .from('kr_messages')
+      .insert({
+        conversation_id,
+        character_id: character.id,
+        role: 'assistant',
+        content_korean: characterContent.korean,
+        content_romanization: characterContent.romanization,
+        content_english: characterContent.english,
+        metadata: { action: characterContent.action || '' }
+      })
+      .select()
+      .single();
+    if (aMsgError) throw aMsgError;
+
+    // Save the correction linked to the user message
+    if (tutorContent.severity !== 'none' || tutorContent.positive_note) {
+      await supabase
+        .from('kr_corrections')
+        .insert({
+          message_id: userMessage.id,
+          what_you_said: tutorContent.what_you_said,
+          what_you_meant: tutorContent.what_you_meant,
+          correct_version_korean: tutorContent.correct_version_korean,
+          correct_version_romanization: tutorContent.correct_version_romanization,
+          mistake_type: tutorContent.mistake_type,
+          pattern_note: tutorContent.pattern_note,
+          positive_note: tutorContent.positive_note,
+          severity: tutorContent.severity
+        });
+    }
+
+    // Cost tracking
+    const charTokensIn = characterResponse.usage.input_tokens;
+    const charTokensOut = characterResponse.usage.output_tokens;
+    const tutorTokensIn = tutorResponse.usage.input_tokens;
+    const tutorTokensOut = tutorResponse.usage.output_tokens;
+    const totalIn = charTokensIn + tutorTokensIn;
+    const totalOut = charTokensOut + tutorTokensOut;
+    const cost = ((totalIn / 1000000) * 3) + ((totalOut / 1000000) * 15);
+
+    console.log(`[noona] ${character.name} responded | tokens in: ${totalIn} | tokens out: ${totalOut} | cost: $${cost.toFixed(4)}`);
+
+    // Return everything to the UI
+    res.json({
+      character: {
+        name: character.name,
+        korean_name: character.korean_name
+      },
+      message: characterContent,
+      correction: tutorContent,
+      cost: cost.toFixed(4)
+    });
+
+  } catch (err) {
+    console.error('Chat error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// GET CONVERSATION HISTORY
+// ============================================================
+app.get('/conversation/:id', async (req, res) => {
+  try {
+    const { data: messages, error } = await supabase
+      .from('kr_messages')
+      .select('*, kr_corrections(*)')
+      .eq('conversation_id', req.params.id)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    res.json({ messages });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// START SERVER
+// ============================================================
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+// ============================================================
+// GET LESSON - returns the lesson for a scenario, generating it if it doesn't exist yet
+// ============================================================
+app.get('/lesson/:scenario_id', async (req, res) => {
+  try {
+    const { scenario_id } = req.params;
+
+    // Check if lesson already exists in cache
+    const { data: existingLesson } = await supabase
+      .from('kr_lessons')
+      .select('*')
+      .eq('scenario_id', scenario_id)
+      .maybeSingle();
+
+    if (existingLesson) {
+      return res.json({ lesson: existingLesson, cached: true });
+    }
+
+    // Generate a new lesson
+    const lesson = await generateLesson(scenario_id);
+    res.json({ lesson, cached: false });
+
+  } catch (err) {
+    console.error('Lesson error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// REGENERATE LESSON - forces a fresh generation
+// ============================================================
+app.post('/lesson/:scenario_id/regenerate', async (req, res) => {
+  try {
+    const { scenario_id } = req.params;
+    await supabase.from('kr_lessons').delete().eq('scenario_id', scenario_id);
+    const lesson = await generateLesson(scenario_id);
+    res.json({ lesson, cached: false });
+  } catch (err) {
+    console.error('Regenerate lesson error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// HELPER: generate a lesson using Noona
+// ============================================================
+async function generateLesson(scenario_id) {
+  // Get scenario and Noona character
+  const { data: scenario, error: scenarioError } = await supabase
+    .from('kr_scenarios')
+    .select('*')
+    .eq('id', scenario_id)
+    .single();
+  if (scenarioError) throw scenarioError;
+
+  const { data: noona, error: noonaError } = await supabase
+    .from('kr_characters')
+    .select('*')
+    .eq('name', 'Noona')
+    .single();
+  if (noonaError) throw noonaError;
+
+  const lessonPrompt = `You are Noona, preparing Asha for a Korean practice scenario. She is a complete beginner — does not know Hangul yet.
+
+SCENARIO: ${scenario.title}
+LOCATION: ${scenario.location}
+DESCRIPTION: ${scenario.description}
+GOAL: ${scenario.goal}
+CULTURAL NOTES: ${scenario.cultural_notes || 'none'}
+
+TARGET VOCAB: ${JSON.stringify(scenario.target_vocab)}
+TARGET GRAMMAR: ${JSON.stringify(scenario.target_grammar)}
+
+Your job: prepare Asha for this scenario with a warm, encouraging mini-lesson. You are her cool older sister, not a textbook professor. Use English for explanation, Korean for examples.
+
+Respond in this EXACT JSON format (no markdown, no preamble):
+{
+  "intro_text": "2-3 sentences. Set the scene warmly. Tell her where she is going, who she will meet, and what the vibe is. Be encouraging. Sprinkle in 1-2 Korean phrases naturally.",
+  "vocab_items": [
+    {
+      "korean": "the Hangul",
+      "romanization": "the romanization",
+      "english": "the English meaning",
+      "example_phrase": "a short example phrase using this word in Korean",
+      "example_phrase_romanization": "the romanization of the example",
+      "example_phrase_english": "the English of the example",
+      "pronunciation": "REQUIRED. A clear pronunciation guide in this exact format: 'A-i-seu → ah-ee-suh' (syllable break with hyphens, arrow, then English phonetic spelling in quotes). Use English sound approximations a beginner can actually say. Examples: 아이스 → 'A-i-seu → ah-ee-suh', 주세요 → 'Ju-se-yo → joo-seh-yo', 안녕하세요 → 'An-nyeong-ha-se-yo → ahn-nyung-hah-seh-yo'. Be generous with phonetics — write it how an English speaker would actually pronounce it.",
+      "noona_tip": "one short, warm sentence from Noona about this word — when to use it, what to remember, etc."
+    }
+  ],
+  "grammar_items": [
+    {
+      "name": "the pattern name in English",
+      "korean": "the Korean pattern (e.g., ~주세요)",
+      "explanation": "2-3 sentences explaining the pattern in plain English, like Noona is breaking it down for a friend",
+      "example_korean": "an example sentence using this pattern",
+      "example_romanization": "the romanization",
+      "example_pronunciation": "REQUIRED. Same format as vocab pronunciation: syllable break with hyphens, then English phonetic spelling. Example: 'A-i-seu a-me-ri-ka-no ju-se-yo → ah-ee-suh ah-meh-ree-kah-no joo-seh-yo'",
+      "example_english": "the English translation"
+    }
+  ],
+  "closing_text": "1-2 sentences. An encouraging send-off. Tell her to relax, that it is okay to mess up, that you will be there if she needs you. End with something like '준비됐어? Let's go!' or similar."
+}
+
+Rules:
+- Cover EVERY vocab item from the target_vocab array (do not skip any)
+- Cover EVERY grammar item from the target_grammar array
+- Keep tips and explanations SHORT and friendly
+- Noona's voice should feel warm, slightly playful, never condescending
+- Do not use markdown or code blocks in your response, just the JSON object`;
+
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-5',
+    max_tokens: 3000,
+    system: noona.system_prompt,
+    messages: [{ role: 'user', content: lessonPrompt }]
+  });
+
+  // Parse the lesson
+  const text = response.content[0].text;
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  const lessonData = JSON.parse(jsonMatch ? jsonMatch[0] : text);
+
+  // Save to database
+  const { data: savedLesson, error: saveError } = await supabase
+    .from('kr_lessons')
+    .insert({
+      scenario_id,
+      intro_text: lessonData.intro_text,
+      vocab_items: lessonData.vocab_items,
+      grammar_items: lessonData.grammar_items,
+      closing_text: lessonData.closing_text
+    })
+    .select()
+    .single();
+  if (saveError) throw saveError;
+
+  const tokensIn = response.usage.input_tokens;
+  const tokensOut = response.usage.output_tokens;
+  const cost = ((tokensIn / 1000000) * 3) + ((tokensOut / 1000000) * 15);
+  console.log(`[noona] Generated lesson for scenario ${scenario_id} | cost: $${cost.toFixed(4)}`);
+
+  return savedLesson;
+}
+
+app.use(express.static(path.join(__dirname, '../ui/dist')));
+app.get(/.*/, (req, res) => res.sendFile(path.join(__dirname, '../ui/dist/index.html')));
+app.listen(PORT, () => {
+  console.log(`[noona] API running on port ${PORT}`);
+});

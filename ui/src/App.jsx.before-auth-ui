@@ -1,0 +1,850 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import "./index.css";
+
+/*
+ * noona says — Korean practice in a quiet Seoul journal.
+ *
+ * Drop-in App.jsx. Pairs with index.css.
+ * Talks to your existing API:
+ *   GET  /scenarios
+ *   POST /start-conversation       { scenario_id }
+ *   POST /chat                     { conversation_id, message }
+ *   GET  /conversation/:id
+ */
+
+const API_BASE = import.meta.env?.VITE_API_BASE ?? "";
+
+/* ------------------------------------------------------------------ *
+ * Character styling (fallback look — colored discs with initial).
+ * Add real PNGs to /public/characters/<slug>.png and they'll be used.
+ * ------------------------------------------------------------------ */
+const CHARACTER_STYLES = {
+  noona:  { color: "var(--noona)",  hangul: "누나",   initial: "누" },
+  minji:  { color: "var(--minji)",  hangul: "민지",   initial: "민" },
+  park:   { color: "var(--taxi)",   hangul: "박기사", initial: "박" },
+  jihye:  { color: "var(--bar)",    hangul: "지혜",   initial: "지" },
+  eomma:  { color: "var(--host)",   hangul: "이모",   initial: "이" },
+  _default: { color: "var(--peach)", hangul: "", initial: "?" },
+};
+
+function characterStyle(name = "") {
+  const key = String(name).toLowerCase().replace(/[^a-z]/g, "");
+  return CHARACTER_STYLES[key] || { ...CHARACTER_STYLES._default, initial: (name[0] || "?").toUpperCase() };
+}
+
+function characterSlug(name = "") {
+  return String(name).toLowerCase().trim().replace(/\s+/g, "-");
+}
+
+/* ============================================================ *
+ * Root
+ * ============================================================ */
+export default function App() {
+  const [view, setView] = useState({ kind: "picker" });
+  const [demoStatus, setDemoStatus] = useState(null);
+
+  // Check if this is demo mode and fetch status
+  useEffect(() => {
+    fetch(`${API_BASE}/demo/status`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.demo) {
+          setDemoStatus(data);
+        }
+      })
+      .catch(err => console.error("demo status fetch failed", err));
+  }, [view.kind]); // refetch when view changes (after sending messages)
+
+  // If demo is blocked (daily cap or visitor cap), show block screen
+  if (demoStatus?.blocked) {
+    if (demoStatus.reason === "daily_cap") {
+      return <DailyFullScreen />;
+    }
+    return <SoftBlockScreen />;
+  }
+
+
+  const startLesson = (scenario) => {
+    setView({ kind: "lesson", scenario });
+  };
+
+  const startConversation = async (scenario) => {
+    setView({ kind: "loading-chat", scenario });
+    try {
+      const res = await fetch(`${API_BASE}/start-conversation`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scenario_id: scenario.id }),
+      });
+      const data = await res.json();
+      setView({
+        kind: "chat",
+        conversationId: data.conversation_id,
+        scenario: data.scenario || scenario,
+        seedMessage: data.opening_message,
+      });
+    } catch (err) {
+      console.error("start-conversation failed", err);
+      setView({ kind: "picker", error: "Couldn't start the scene. Try again?" });
+    }
+  };
+
+  return (
+    <div className="app-shell">
+      {demoStatus && !demoStatus.blocked && (
+        <DemoBanner status={demoStatus} />
+      )}
+      {view.kind === "picker" && (
+        <ScenarioPicker
+          onPick={startLesson}
+          error={view.error}
+        />
+      )}
+      {view.kind === "lesson" && (
+        <LessonScreen
+          scenario={view.scenario}
+          onStartChat={() => startConversation(view.scenario)}
+          onBack={() => setView({ kind: "picker" })}
+        />
+      )}
+      {view.kind === "loading-chat" && (
+        <ChatLoadingCurtain scenario={view.scenario} />
+      )}
+      {view.kind === "chat" && (
+        <ChatScreen
+          key={view.conversationId}
+          conversationId={view.conversationId}
+          scenario={view.scenario}
+          seedMessage={view.seedMessage}
+          onBack={() => setView({ kind: "picker" })}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ============================================================ *
+ * Scenario Picker
+ * ============================================================ */
+function ScenarioPicker({ onPick, error }) {
+  const [scenarios, setScenarios] = useState(null);
+  const [fetchError, setFetchError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_BASE}/scenarios`)
+      .then(r => r.json())
+      .then(data => { if (!cancelled) setScenarios(Array.isArray(data) ? data : (data.scenarios || [])); })
+      .catch(err => { if (!cancelled) setFetchError(err.message || "Network error"); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const today = useMemo(() => {
+    return new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
+  }, []);
+
+  return (
+    <main className="picker stage">
+      <header className="picker-head">
+        <div>
+          <span className="eyebrow">Quiet Korean · A small daily habit</span>
+          <h1 className="brand">
+            <span className="brand-mark">noona <span className="says">says</span></span>
+            <span className="brand-hangul">누나가 말하길</span>
+          </h1>
+          <span className="brand-sub">
+            Slow, kind Korean practice in real Seoul places. Pick a scene and step inside.
+          </span>
+        </div>
+        <div className="weather-strip">
+          <strong>{today}</strong>
+          서울 · good morning
+        </div>
+      </header>
+
+      {(error || fetchError) && (
+        <div className="notice" role="alert">{error || fetchError}</div>
+      )}
+
+      <div className="section-label">
+        <h2>Today's scenes</h2>
+        <span className="count">{scenarios ? `${scenarios.length} available` : "loading…"}</span>
+      </div>
+
+      {scenarios === null ? (
+        <PickerSkeleton />
+      ) : (
+        <div className="cards">
+          {scenarios.map((s, i) => (
+            <ScenarioCard key={s.id ?? i} scenario={s} index={i} onPick={() => onPick(s)} />
+          ))}
+        </div>
+      )}
+
+      <footer className="picker-foot">
+        <span>누나는 기다리고 있어요</span>
+        <span>v 0.3</span>
+      </footer>
+    </main>
+  );
+}
+
+function ScenarioCard({ scenario, index, onPick }) {
+  // Tolerate either { title_kr, title_en, ... } or simpler API shapes.
+  const titleKr     = scenario.title_kr   ?? scenario.titleKr   ?? scenario.title ?? "";
+  const titleEn     = scenario.title_en   ?? scenario.titleEn   ?? scenario.subtitle ?? "";
+  const location    = scenario.location   ?? scenario.place     ?? "";
+  const blurb       = scenario.description ?? scenario.blurb    ?? "";
+  const difficulty  = Number(scenario.difficulty ?? 1);
+  const duration    = scenario.duration   ?? scenario.estimated_minutes ?? "";
+  const characterName = scenario.character?.name ?? scenario.character_name ?? "Noona";
+
+  return (
+    <button className="card" onClick={onPick} style={{ animationDelay: `${0.05 * index}s` }}>
+      <div className="card-top">
+        <div className="card-meta">
+          {location && <span className="card-location">{location}</span>}
+          <h3 className="card-title">
+            {titleKr || titleEn}
+            {titleKr && titleEn && <span className="card-title-en">{titleEn}</span>}
+          </h3>
+        </div>
+        <div className="card-stamp" aria-hidden="true">
+          <Avatar name={characterName} size={44} />
+          <span className="stamp-name">{characterName}</span>
+        </div>
+      </div>
+
+      {blurb && <p className="card-body">{blurb}</p>}
+
+      <div className="card-foot">
+        <span className="difficulty">
+          <span className="diff-pips">
+            {[0,1,2].map(i => (
+              <span key={i} className={i < difficulty ? "on" : ""}></span>
+            ))}
+          </span>
+          {difficulty === 1 ? "Gentle" : difficulty === 2 ? "Steady" : "A stretch"}
+          {duration && ` · ${typeof duration === "number" ? `${duration} min` : duration}`}
+        </span>
+        <span className="card-cta">Step inside</span>
+      </div>
+
+      <span className="card-corner">№ {String(index + 1).padStart(2, "0")}</span>
+    </button>
+  );
+}
+
+function PickerSkeleton() {
+  return (
+    <div className="cards">
+      {[0,1,2,3].map(i => (
+        <div className="card skeleton" key={i} aria-hidden="true">
+          <div className="sk-line w70" />
+          <div className="sk-line w90 lg" />
+          <div className="sk-line w95" />
+          <div className="sk-line w60" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ============================================================ *
+ * Chat
+ * ============================================================ */
+function ChatScreen({ conversationId, scenario, seedMessage, onBack }) {
+  const [messages, setMessages] = useState(() => seedMessage ? [seedMessage] : []);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const [showRoman, setShowRoman] = useState(() => readPref("show-roman", true));
+  const [showEn, setShowEn] = useState(() => readPref("show-en", true));
+  const [showCorrections, setShowCorrections] = useState(() => readPref("show-corrections", true));
+
+  const scrollerRef = useRef(null);
+  const textareaRef = useRef(null);
+
+  // Hydrate full message list if we only have the seed
+  useEffect(() => {
+    if (!conversationId) return;
+    let cancelled = false;
+    fetch(`${API_BASE}/conversation/${conversationId}`)
+      .then(r => r.json())
+      .then(data => {
+        if (cancelled) return;
+        if (Array.isArray(data?.messages) && data.messages.length) {
+          setMessages(data.messages);
+        }
+      })
+      .catch(err => console.warn("conversation hydrate failed", err));
+    return () => { cancelled = true; };
+  }, [conversationId]);
+
+  // Persist toggle prefs
+  useEffect(() => writePref("show-roman", showRoman), [showRoman]);
+  useEffect(() => writePref("show-en", showEn), [showEn]);
+  useEffect(() => writePref("show-corrections", showCorrections), [showCorrections]);
+
+  // Autoscroll
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [messages, sending]);
+
+  // Autosize textarea
+  useEffect(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight, 140) + "px";
+  }, [draft]);
+
+  const send = async () => {
+    const text = draft.trim();
+    if (!text || sending) return;
+
+    const optimistic = {
+      id: `local-${Date.now()}`,
+      role: "user",
+      user_input: text,
+      content_korean: text,
+      content_romanization: "",
+      content_english: "",
+    };
+    setMessages(m => [...m, optimistic]);
+    setDraft("");
+    setSending(true);
+
+    try {
+      const res = await fetch(`${API_BASE}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ conversation_id: conversationId, message: text }),
+      });
+      const data = await res.json();
+
+      setMessages(m => {
+        // Attach any correction back to the user's last message, then append character reply
+        const next = m.map(msg => msg.id === optimistic.id && data.correction
+          ? { ...msg, kr_corrections: [...(msg.kr_corrections || []), data.correction] }
+          : msg);
+        if (data.message) next.push(data.message);
+        return next;
+      });
+    } catch (err) {
+      console.error("send failed", err);
+      setMessages(m => m.map(msg => msg.id === optimistic.id
+        ? { ...msg, _error: "Couldn't send — try again." }
+        : msg));
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const onKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  };
+
+  const characterName = scenario?.character?.name ?? scenario?.character_name ?? "Noona";
+  const charStyle = characterStyle(characterName);
+
+  return (
+    <section className="chat-screen">
+      <header className="chat-header">
+        <div className="chat-header-row">
+          <button className="back-btn" onClick={onBack} aria-label="Back to scenarios">←</button>
+
+          <div className="chat-character">
+            <Avatar name={characterName} size={40} />
+            <div className="chat-character-text">
+              <span className="chat-character-name">
+                {charStyle.hangul || characterName}
+                <span className="chat-character-romaji"> · {characterName}</span>
+              </span>
+              <span className="chat-character-scene">
+                {(scenario?.title_en || scenario?.title || "") + (scenario?.location ? ` — ${scenario.location}` : "")}
+              </span>
+            </div>
+          </div>
+
+          <div className="chat-toggles" role="group" aria-label="Display options">
+            <button className="toggle" aria-pressed={showRoman} onClick={() => setShowRoman(v => !v)} title="Show romanization">Aa</button>
+            <button className="toggle" aria-pressed={showEn} onClick={() => setShowEn(v => !v)} title="Show English">EN</button>
+            <button className="toggle" aria-pressed={showCorrections} onClick={() => setShowCorrections(v => !v)} title="Show Noona's notes">누나</button>
+          </div>
+        </div>
+
+        {scenario?.description && (
+          <div className="chat-scenelet">
+            <p className="scenelet">{scenario.description}</p>
+          </div>
+        )}
+      </header>
+
+      <div className="chat-body" ref={scrollerRef}>
+        <div className="chat-list">
+          {messages.map((m) => (
+            <Message
+              key={m.id}
+              message={m}
+              showRoman={showRoman}
+              showEn={showEn}
+              showCorrections={showCorrections}
+              defaultCharacterName={characterName}
+            />
+          ))}
+
+          {sending && (
+            <div className="msg character">
+              <Avatar name={characterName} size={36} />
+              <div className="typing" aria-label={`${characterName} is thinking`}>
+                <span></span><span></span><span></span>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="chat-input">
+        <div className="chat-input-inner">
+          <button className="icon-btn" aria-label="Voice (coming soon)" title="Voice (coming soon)" disabled>
+            <MicIcon />
+          </button>
+          <textarea
+            ref={textareaRef}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder="한국어로 답해보세요…   reply in Korean"
+            rows={1}
+          />
+          <button className="icon-btn send-btn" onClick={send} disabled={!draft.trim() || sending} aria-label="Send">
+            <SendIcon />
+          </button>
+        </div>
+        <div className="input-foot">
+          <span>Enter to send · Shift+Enter for line break</span>
+          <span>누나 is listening</span>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function Message({ message, showRoman, showEn, showCorrections, defaultCharacterName }) {
+  const isUser = message.role === "user";
+  const characterName = message.character?.name ?? defaultCharacterName;
+
+  // The Korean to display: characters use content_korean; users see what they typed.
+  const koreanText = isUser
+    ? (message.user_input || message.content_korean || "")
+    : (message.content_korean || "");
+
+  return (
+    <div>
+      <div className={`msg ${isUser ? "user" : "character"}`}>
+        {!isUser && <Avatar name={characterName} size={36} />}
+        <div className="bubble">
+          {koreanText && <p className="kr">{koreanText}</p>}
+          {showRoman && message.content_romanization && (
+            <span className="romanization">{message.content_romanization}</span>
+          )}
+          {showRoman && message.metadata?.pronunciation && (
+            <span className="pronunciation">{message.metadata.pronunciation}</span>
+          )}
+          {showEn && !isUser && message.content_english && (
+            <span className="translation">{message.content_english}</span>
+          )}
+          {message._error && <span className="error-line">{message._error}</span>}
+        </div>
+      </div>
+
+      {message.metadata?.action && (
+        <div className={`action-line ${isUser ? "user" : ""}`}>{message.metadata.action}</div>
+      )}
+
+      {showCorrections && message.kr_corrections?.length > 0 &&
+        message.kr_corrections.map((c, i) => (
+          <Correction key={i} correction={c} side={isUser ? "user" : "character"} />
+        ))
+      }
+    </div>
+  );
+}
+
+function Correction({ correction, side }) {
+  return (
+    <div className={`correction ${side}`}>
+      <div className="correction-header">
+        <span className="correction-sig">a note from Noona</span>
+        {correction.severity && (
+          <span className="correction-severity">{correction.severity}</span>
+        )}
+      </div>
+      {correction.positive_note && (
+        <p className="correction-positive">"{correction.positive_note}"</p>
+      )}
+      {correction.correct_version_korean && (
+        <div className="correction-fix">
+          <p className="kr">{correction.correct_version_korean}</p>
+          {correction.correct_version_romanization && (
+            <span className="romanization">{correction.correct_version_romanization}</span>
+          )}
+          {correction.correct_version_pronunciation && (
+            <span className="pronunciation">{correction.correct_version_pronunciation}</span>
+          )}
+        </div>
+      )}
+      {correction.pattern_note && (
+        <p className="correction-pattern">
+          <strong>pattern</strong>
+          {correction.pattern_note}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================ *
+ * Loading curtain between picker and chat
+ * ============================================================ */
+function ChatLoadingCurtain({ scenario }) {
+  return (
+    <div className="curtain">
+      <div className="curtain-inner">
+        <span className="eyebrow">Stepping inside</span>
+        <h2 className="curtain-title hangul">{scenario?.title_kr ?? scenario?.title ?? "잠시만요…"}</h2>
+        <div className="typing" aria-label="loading">
+          <span></span><span></span><span></span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================ *
+ * Avatar — colored disc with initial, falls back from <img>.
+ * ============================================================ */
+function Avatar({ name, size = 36 }) {
+  const [imgOk, setImgOk] = useState(true);
+  const style = characterStyle(name);
+  const slug = characterSlug(name);
+  return (
+    <span
+      className="avatar"
+      style={{
+        width: size,
+        height: size,
+        fontSize: Math.round(size * 0.45),
+        background: style.color,
+      }}
+      aria-label={`${name} avatar`}
+    >
+      {imgOk
+        ? <img src={`/characters/${slug}.png`} alt="" onError={() => setImgOk(false)} />
+        : style.initial}
+    </span>
+  );
+}
+
+/* ------------------------------------------------------------ *
+ * Tiny helpers
+ * ------------------------------------------------------------ */
+function readPref(key, fallback) {
+  try {
+    const raw = localStorage.getItem(`noonasays.${key}`);
+    return raw === null ? fallback : JSON.parse(raw);
+  } catch { return fallback; }
+}
+function writePref(key, value) {
+  try { localStorage.setItem(`noonasays.${key}`, JSON.stringify(value)); } catch {}
+}
+
+function MicIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="9" y="3" width="6" height="12" rx="3" />
+      <path d="M5 11a7 7 0 0 0 14 0" />
+      <line x1="12" y1="18" x2="12" y2="21" />
+      <line x1="9" y1="21" x2="15" y2="21" />
+    </svg>
+  );
+}
+function SendIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5 12l14-7-5 14-3-6-6-1z" />
+    </svg>
+  );
+}
+
+
+/* ============================================================ *
+ * Lesson Screen - Noona prepares you before the scenario
+ * ============================================================ */
+function LessonScreen({ scenario, onStartChat, onBack }) {
+  const [lesson, setLesson] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [regenerating, setRegenerating] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    fetch(`${API_BASE}/lesson/${scenario.id}`)
+      .then(r => r.json())
+      .then(data => {
+        if (cancelled) return;
+        setLesson(data.lesson);
+        setLoading(false);
+      })
+      .catch(err => {
+        if (cancelled) return;
+        console.error("lesson fetch failed", err);
+        setError("Couldn't load the lesson. Try again?");
+        setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [scenario.id]);
+
+  const regenerate = async () => {
+    setRegenerating(true);
+    try {
+      const res = await fetch(`${API_BASE}/lesson/${scenario.id}/regenerate`, {
+        method: "POST",
+      });
+      const data = await res.json();
+      setLesson(data.lesson);
+    } catch (err) {
+      console.error("regenerate failed", err);
+    }
+    setRegenerating(false);
+  };
+
+  if (loading) {
+    return (
+      <div className="lesson-loading">
+        <div className="lesson-loading-inner">
+          <div className="lesson-loading-disc">
+            <div className="noona-disc" style={{ background: "var(--noona)" }}>누</div>
+          </div>
+          <p className="lesson-loading-text">Noona is preparing your lesson...</p>
+          <p className="lesson-loading-sub">잠깐만요 · just a moment</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error || !lesson) {
+    return (
+      <div className="lesson-error">
+        <p>{error || "Something went wrong."}</p>
+        <button onClick={onBack}>Back to scenarios</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="lesson-screen">
+      <header className="lesson-header">
+        <button className="back-btn" onClick={onBack}>← scenarios</button>
+        <div className="lesson-header-title">
+          <div className="lesson-eyebrow">lesson · before you go</div>
+          <h1>{scenario.title || scenario.title_en}</h1>
+        </div>
+        <button
+          className="skip-btn"
+          onClick={onStartChat}
+          title="Skip the lesson and jump straight into the chat"
+        >
+          skip to chat →
+        </button>
+      </header>
+
+      <div className="lesson-body">
+        <section className="lesson-intro">
+          <div className="lesson-intro-avatar">
+            <div className="noona-disc" style={{ background: "var(--noona)" }}>누</div>
+          </div>
+          <div className="lesson-intro-text">
+            <div className="lesson-speaker">Noona · 누나</div>
+            <p>{lesson.intro_text}</p>
+          </div>
+        </section>
+
+        {lesson.vocab_items && lesson.vocab_items.length > 0 && (
+          <section className="lesson-section">
+            <h2 className="lesson-section-title">vocabulary · 어휘</h2>
+            <div className="vocab-cards">
+              {lesson.vocab_items.map((item, i) => (
+                <article key={i} className="vocab-card">
+                  <div className="vocab-card-head">
+                    <div className="vocab-korean">{item.korean}</div>
+                    <div className="vocab-romanization">{item.romanization}</div>
+                  </div>
+                  {item.pronunciation && (
+                    <div className="vocab-pronunciation">{item.pronunciation}</div>
+                  )}
+                  <div className="vocab-english">{item.english}</div>
+                  {item.example_phrase && (
+                    <div className="vocab-example">
+                      <div className="vocab-example-korean">{item.example_phrase}</div>
+                      <div className="vocab-example-rom">{item.example_phrase_romanization}</div>
+                      <div className="vocab-example-eng">{item.example_phrase_english}</div>
+                    </div>
+                  )}
+                  {item.noona_tip && (
+                    <div className="vocab-tip">
+                      <span className="vocab-tip-label">noona:</span> {item.noona_tip}
+                    </div>
+                  )}
+                </article>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {lesson.grammar_items && lesson.grammar_items.length > 0 && (
+          <section className="lesson-section">
+            <h2 className="lesson-section-title">grammar · 문법</h2>
+            <div className="grammar-cards">
+              {lesson.grammar_items.map((item, i) => (
+                <article key={i} className="grammar-card">
+                  <div className="grammar-card-head">
+                    <div className="grammar-name">{item.name}</div>
+                    <div className="grammar-korean">{item.korean}</div>
+                  </div>
+                  <p className="grammar-explanation">{item.explanation}</p>
+                  {item.example_korean && (
+                    <div className="grammar-example">
+                      <div className="grammar-example-korean">{item.example_korean}</div>
+                      <div className="grammar-example-rom">{item.example_romanization}</div>
+                      {item.example_pronunciation && (
+                        <div className="grammar-example-pronunciation">{item.example_pronunciation}</div>
+                      )}
+                      <div className="grammar-example-eng">{item.example_english}</div>
+                    </div>
+                  )}
+                </article>
+              ))}
+            </div>
+          </section>
+        )}
+
+        <section className="lesson-closing">
+          <div className="lesson-intro-avatar">
+            <div className="noona-disc" style={{ background: "var(--noona)" }}>누</div>
+          </div>
+          <div className="lesson-intro-text">
+            <p>{lesson.closing_text}</p>
+          </div>
+        </section>
+
+        <div className="lesson-actions">
+          <button className="lesson-cta" onClick={onStartChat}>
+            준비됐어 · I'm ready, let's go
+          </button>
+          <button
+            className="lesson-regen"
+            onClick={regenerate}
+            disabled={regenerating}
+          >
+            {regenerating ? "regenerating..." : "↻ regenerate lesson"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+/* ============================================================ *
+ * Demo Mode — banner + block screens
+ * ============================================================ */
+function DemoBanner({ status }) {
+  const used = status.messagesUsed || 0;
+  const cap = status.messagesCap || 10;
+  const remaining = Math.max(0, cap - used);
+  
+  return (
+    <div className="demo-banner">
+      <div className="demo-banner-inner">
+        <div className="demo-banner-label">
+          <span className="demo-pill">DEMO</span>
+          <span className="demo-text">
+            {remaining} {remaining === 1 ? "message" : "messages"} left in your preview
+          </span>
+        </div>
+        <div className="demo-progress">
+          <div 
+            className="demo-progress-fill" 
+            style={{ width: `${(remaining / cap) * 100}%` }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SoftBlockScreen() {
+  return (
+    <div className="block-screen">
+      <div className="block-screen-inner">
+        <div className="block-disc">누</div>
+        <div className="block-hangul">감사합니다</div>
+        <div className="block-romanization">gam-sa-ham-ni-da</div>
+        <div className="block-translation">thank you</div>
+        
+        <h1 className="block-title">Thanks for trying Noona Says!</h1>
+        
+        <p className="block-body">
+          You've reached the end of your 10-message preview. Hope you got a taste of what 
+          learning Korean with Noona feels like — and maybe even ordered yourself an 
+          imaginary iced americano.
+        </p>
+        
+        <p className="block-body block-body-soft">
+          Check back later for more scenarios, full conversations, and voice support coming soon.
+        </p>
+        
+        <div className="block-signature">
+          <span className="block-signature-hangul">— 누나</span>
+          <span className="block-signature-en">Noona</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DailyFullScreen() {
+  return (
+    <div className="block-screen">
+      <div className="block-screen-inner">
+        <div className="block-disc">☕</div>
+        <div className="block-hangul">잠깐만요</div>
+        <div className="block-romanization">jam-kkan-man-yo</div>
+        <div className="block-translation">just a moment</div>
+        
+        <h1 className="block-title">The demo's taking a coffee break</h1>
+        
+        <p className="block-body">
+          Looks like a lot of people are practicing Korean today! The demo has used up 
+          its daily allowance.
+        </p>
+        
+        <p className="block-body block-body-soft">
+          Please come back tomorrow — Noona will be here, fresh and ready to teach.
+        </p>
+        
+        <div className="block-signature">
+          <span className="block-signature-hangul">— 내일 봐요</span>
+          <span className="block-signature-en">see you tomorrow</span>
+        </div>
+      </div>
+    </div>
+  );
+}
